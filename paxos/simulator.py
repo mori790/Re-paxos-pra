@@ -1,9 +1,12 @@
+# paxos/simulator.py
+
 from dataclasses import dataclass
 from typing import Optional
 
-from paxos.message import AcceptRequest, Accepted, Prepare, Promise
-from paxos.node import Acceptor
+from paxos.message import Accepted, Promise
+from paxos.node import Acceptor, Proposer
 from paxos.types import NodeId, ProposalNumber, Value
+
 
 @dataclass
 class PaxosResult:
@@ -25,19 +28,19 @@ class PaxosResult:
     promises: list[Promise]
     accepted: list[Accepted]
 
+
 class PaxosSimulator:
     """
     教育用のシンプルなPaxosシミュレータ。
 
-    まずは1つのProposerが、複数のAcceptorに対して
-    Prepare -> Promise -> AcceptRequest -> Accepted
-    の流れを実行する。
+    Simulator 自体はPaxosの判断を持ちすぎない。
+    Proposer と Acceptor のメッセージ交換を進める役割にする。
     """
 
     def __init__(self, acceptors: list[Acceptor]) -> None:
         if len(acceptors) == 0:
             raise ValueError("At least one acceptor is required.")
-        
+
         self.acceptors = acceptors
 
     @property
@@ -49,132 +52,115 @@ class PaxosSimulator:
             3台なら2
             5台なら3
         """
-        
+
         return len(self.acceptors) // 2 + 1
-    
+
     def propose(
-            self,
-            proposer_id: NodeId,
-            proposal_number: ProposalNumber,
-            value: Value,
+        self,
+        proposer_id: NodeId,
+        proposal_number: ProposalNumber,
+        value: Value,
     ) -> PaxosResult:
         """
         1つの値をPaxosで提案する。
 
         Phase 1:
-            Prepareを全Acceptorに送る。
-            多数派からPromiseが返ってきたら次へ進む。
+            Proposer が Prepare を作る。
+            Acceptor が Promise を返す。
+            Proposer が Promise を保存する。
 
         Phase 2:
-            AcceptRequestを全Acceptorに送る。
-            多数派からAcceptedが返ってきたらchosen。
+            Proposer が AcceptRequest を作る。
+            Acceptor が Accepted を返す。
+            Proposer が Accepted を保存する。
+
+        多数派の Accepted が集まったら chosen。
         """
 
-        promises = self._send_prepare_to_all(
-            proposer_id=proposer_id,
+        proposer = Proposer(
+            node_id=proposer_id,
             proposal_number=proposal_number,
+            origin_value=value,
         )
-        # Phase1
-        if len(promises) < self.majority_size:
+
+        self._run_prepare_phase(proposer)
+
+        if not proposer.has_majority_promises(self.majority_size):
             return PaxosResult(
                 chosen_value=None,
-                promises=promises,
+                promises=proposer.promises,
                 accepted=[],
             )
-        
-        proposed_value = self._select_value_from_promises(
-            original_value=value,
-            promises=promises,
+
+        selected_value = proposer.select_value()
+
+        self._run_accept_phase(
+            proposer=proposer,
+            value=selected_value,
         )
 
-        accepted = self._send_accept_request_to_all(
-            proposer_id=proposer_id,
-            proposal_number=proposal_number,
-            value=proposed_value,
-        )
-        # Phase2
-        if len(accepted) < self.majority_size:
+        if not proposer.has_majority_accepted(self.majority_size):
             return PaxosResult(
                 chosen_value=None,
-                promises=promises,
-                accepted=accepted,
+                promises=proposer.promises,
+                accepted=proposer.accepted,
             )
-        
+
         return PaxosResult(
-            chosen_value=proposed_value,
-            promises=promises,
-            accepted=accepted,
+            chosen_value=selected_value,
+            promises=proposer.promises,
+            accepted=proposer.accepted,
         )
-    
-    def _send_prepare_to_all(
-            self,
-            proposer_id: NodeId,
-            proposal_number: ProposalNumber,
-    ) -> list[Promise]:
-        promises: list[Promise] = []
+
+    def _run_prepare_phase(self, proposer: Proposer) -> None:
+        """
+        Phase 1: Prepare / Promise
+
+        Proposer が各 Acceptor に Prepare を送り、
+        返ってきた Promise を保存する。
+        """
 
         for acceptor in self.acceptors:
-            prepare = Prepare(
-                proposer_id=proposer_id,
-                acceptor_id=acceptor.node_id,
-                proposal_number=proposal_number,
-            )
+            prepare = proposer.create_prepare(acceptor_id=acceptor.node_id)
 
-            response = acceptor.on_prepare(prepare)
+            print(f"{proposer.node_id} -> {acceptor.node_id}: {prepare}")
 
-            if response is not None:
-                promises.append(response)
+            promise = acceptor.on_prepare(prepare)
 
-        return promises
-    
-    def _send_accept_request_to_all(
-            self,
-            proposer_id:NodeId,
-            proposal_number: ProposalNumber,
-            value: Value,
-    ) -> list[Accepted]:
-        accepted: list[Accepted] = []
+            if promise is None:
+                print(f"{acceptor.node_id} -> {proposer.node_id}: rejected Prepare")
+                continue
+
+            print(f"{acceptor.node_id} -> {proposer.node_id}: {promise}")
+
+            proposer.receive_promise(promise)
+
+    def _run_accept_phase(
+        self,
+        proposer: Proposer,
+        value: Value,
+    ) -> None:
+        """
+        Phase 2: AcceptRequest / Accepted
+
+        Proposer が各 Acceptor に AcceptRequest を送り、
+        返ってきた Accepted を保存する。
+        """
 
         for acceptor in self.acceptors:
-            accept_request = AcceptRequest(
-                proposer_id=proposer_id,
+            accept_request = proposer.create_accept_request(
                 acceptor_id=acceptor.node_id,
-                proposal_number=proposal_number,
                 value=value,
             )
 
-            response = acceptor.on_accept_request(accept_request)
+            print(f"{proposer.node_id} -> {acceptor.node_id}: {accept_request}")
 
-            if response is not None:
-                accepted.append(response)
-        
-        return accepted
-    
-    def _select_value_from_promises(
-            self,
-            original_value: Value,
-            promises: list[Promise],
-    ) -> Value:
-        """
-        Promiseの中に過去にacceptedされた値があれば、
-        その中で最も大きいaccepted_numberの値を採用する。
+            accepted = acceptor.on_accept_request(accept_request)
 
-        何もacceptedされていなければ、元々提案した値を使う。
-        """
+            if accepted is None:
+                print(f"{acceptor.node_id} -> {proposer.node_id}: rejected AcceptRequest")
+                continue
 
-        promises_with_accepted_value = [
-            promise
-            for promise in promises
-            if promise.accepted_number is not None
-            and promise.accepted_value is not None
-        ]
+            print(f"{acceptor.node_id} -> {proposer.node_id}: {accepted}")
 
-        if len(promises_with_accepted_value) == 0:
-            return original_value
-        
-        latest_promise = max(
-            promises_with_accepted_value,
-            key=lambda promise: promise.accepted_number, 
-        )
-
-        return latest_promise.accepted_value
+            proposer.receive_accepted(accepted)

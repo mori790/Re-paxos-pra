@@ -146,7 +146,7 @@ class Proposer:
         ]
         
         if len(promises_with_accepted_value) == 0:
-            return self.original_value
+            return self.origin_value
         
         latest_promise = max(
             promises_with_accepted_value,
@@ -170,4 +170,24 @@ class Proposer:
             proposal_number=self.proposal_number,
             value=value,
         )
+
+    def receive_accepted(self, accepted: Accepted) -> None:
+        """
+        Acceptor から返ってきた Accepted を保存する。
+        """
+
+        if accepted.proposer_id != self.node_id:
+            return
+
+        if accepted.proposal_number != self.proposal_number:
+            return
+
+        self.accepted.append(accepted)
+
+    def has_majority_accepted(self, majority_size: int) -> bool:
+        """
+        Accepted が多数派に達したか確認する。
+        """
+
+        return len(self.accepted) >= majority_size
         
